@@ -1,0 +1,588 @@
+#include <avr/wdt.h>
+#include <Joystick.h>
+#include <EEPROM.h>
+#include "Keyboard.h"
+#include "Mouse.h"
+#include "common.h"
+#include "MSP.h"
+
+/*
+*****************************************************************************************
+* CONSTANTS
+*****************************************************************************************
+*/
+//#define DEBUG
+
+
+#define MAGIC_ID                0xcafebabe
+#define ANALOG_RETRY_COUNT      5
+
+// timeouts (ms)
+#define TIMEOUT_SHIFT_MCLICKS   500
+#define TIMEOUT_STICK_REPORT    5
+#define TIMEOUT_BATTERY_REPORT  1000
+
+// PINS
+// analog axis
+#define PIN_A_AXIS_LEFT_X       A0
+#define PIN_A_AXIS_LEFT_Y       A1
+#define PIN_A_AXIS_RIGHT_X      A2
+#define PIN_A_AXIS_RIGHT_Y      A3
+
+#define PIN_A_AXIS_HAT_X        A10
+#define PIN_A_AXIS_HAT_Y        A9
+#define PIN_A_BATTERY_SENSE     A8
+
+// left side buttons
+#define PIN_BTN_LTHUMB          15
+#define PIN_BTN_SHIFT           PIN_BTN_LTHUMB
+#define PIN_BTN_L1              6
+#define PIN_BTN_L2              16
+#define PIN_BTN_START           1
+
+// right side
+//#define PIN_BTN_RTHUMB         7
+#define PIN_BTN_R1              5
+#define PIN_BTN_R2              14
+#define PIN_BTN_A               4
+#define PIN_BTN_B               3
+#define PIN_BTN_X               2
+#define PIN_BTN_Y               0
+#define PIN_BTN_SELECT          7
+
+#define BTN_HW_CNTS             (sizeof(TBL_PIN_BUTTONS) - 1)   // 10
+#define BTN_TOTAL_CNTS          (BTN_HW_CNTS * 2 + 1)           // 21 (shift key included)
+#define BTN_REPORT_CNTS         (BTN_HW_CNTS * 2 - 2)           // 18
+#define BTN_IDX_MOUSE_MODE      (BTN_REPORT_CNTS + 1)           // 19
+#define BTN_IDX_JOYSTICK_MODE   (BTN_REPORT_CNTS + 2)           // 20
+
+// hatState buttons
+#define HAT_CNTS                1
+#define HAT_ADC_NO_KEY         (1023 * 0.8)
+#define HAT_ADC_RIGHT_UP        (1023 * 0.65)
+#define HAT_ADC_RIGHT_DOWN     (1023 * 0.40)
+// 1 ADC pin for exclusive buttons
+//
+// Vcc     Ain
+//  |      |
+//  +--R1--+
+//  R2     |
+//  +-- \--+  up     N = 2 switches
+//  R2     |
+//  +-- \--+  down
+//  R2
+//  |
+//  =
+//
+// n   = 1 ~ N
+// Rhi = (R1 * n * R2) / (R1 + n * R2)
+// Rlo = ((N + 1) - n) * R2
+// Vout = Vcc * (Rlo / (Rhi + Rlo))
+//
+
+#define HAT_NONE               0
+#define HAT_LEFT               8
+#define HAT_RIGHT              2
+#define HAT_UP                 1
+#define HAT_DOWN               4
+//        1
+//    9   |   3
+//        |
+//  8 ----0----  2
+//        |
+//   12   |   6
+//        4
+
+
+
+/*
+*****************************************************************************************
+* MACROS
+*****************************************************************************************
+*/
+#define ABS(a)                  (((a) >= 0)? (a) : -(a))
+#define MIN(a, b)               (((a) <= (b))? (a) : (b))
+#define MAX(a, b)               (((a) >= (b))? (a) : (b))
+
+
+/*
+*****************************************************************************************
+* TYPES
+*****************************************************************************************
+*/
+struct axis_range {
+    u16     minX, maxX;
+    u16     minY, maxY;
+};
+
+struct cal_info {
+    u32                 dwMagicID;
+    struct axis_range   left;
+    struct axis_range   right;
+};
+
+// Packet
+enum pad_cmd {
+    CMD_NONE = 0,
+    CMD_BATTERY,
+};
+
+enum pad_mode {
+    MODE_KEYBOARD = 0,
+    MODE_JOYSTICK,
+    MODE_MOUSE,
+};
+
+class SubMSP;
+
+
+/*
+*****************************************************************************************
+* CONSTANT TABLES
+*****************************************************************************************
+*/
+static const u8 PROGMEM TBL_PIN_BUTTONS[] = {
+    PIN_BTN_SHIFT,
+    PIN_BTN_A,   PIN_BTN_B,   PIN_BTN_X,   PIN_BTN_Y,      PIN_BTN_L1,
+    PIN_BTN_R1,  PIN_BTN_L2,  PIN_BTN_R2,  PIN_BTN_SELECT, PIN_BTN_START,
+};
+
+static const u8 PROGMEM TBL_PIN_ANALOG[] = {
+    PIN_A_AXIS_LEFT_X,  PIN_A_AXIS_LEFT_Y,
+    PIN_A_AXIS_RIGHT_X, PIN_A_AXIS_RIGHT_Y,
+    PIN_A_AXIS_HAT_X,  PIN_A_AXIS_HAT_Y,
+    PIN_A_BATTERY_SENSE
+};
+
+static const s16 PROGMEM TBL_ANGLES[] = {
+     -1,   0,  90,  45,
+    180,  -1, 135,  -1,
+    270, 315,  -1,  -1,
+    225
+};
+
+static const u8 PROGMEM TBL_MAP_HAT_KEY[] = {
+    HAT_UP,    KEY_UP_ARROW,
+    HAT_DOWN,  KEY_DOWN_ARROW,
+    HAT_LEFT,  KEY_LEFT_ARROW,
+    HAT_RIGHT, KEY_RIGHT_ARROW
+};
+
+static const u8 PROGMEM TBL_MAP_BTN_KEY[] = {
+    KEY_RETURN,     // A
+    KEY_ESC,        // B
+    KEY_BACKSPACE,  // X
+    KEY_TAB,        // Y
+    KEY_LEFT_SHIFT, // L1
+    KEY_RIGHT_SHIFT,// R1
+    KEY_LEFT_CTRL,  // L2
+    KEY_RIGHT_CTRL, // R2
+    KEY_ESC,        // SELECT
+    KEY_RETURN,     // START
+
+    '1',            // SHIFT + A
+    '2',            // SHIFT + B
+    '3',            // SHIFT + X
+    '4',            // SHIFT + Y
+    '5',            // SHIFT + L1
+    '6',            // SHIFT + R1
+    '7',            // SHIFT + L2
+    '8',            // SHIFT + R2
+};
+
+static const u8 PROGMEM TBL_MAP_BTN_MOUSE[] = {
+    MOUSE_LEFT,     // A
+    MOUSE_RIGHT,    // B
+    MOUSE_MIDDLE,   // X
+};
+
+
+/*
+*****************************************************************************************
+* VARIABLES
+*****************************************************************************************
+*/
+static struct cal_info  mCalInfo;
+static u8               mLastBtnState[BTN_TOTAL_CNTS];
+static bool             mIsCalMode     = false;
+static long             mFirstShiftOnlyTS = 0;
+static u8               mShiftOnlyCtr  = 0;
+static u8               mLastHatState  = HAT_NONE;
+static long             mLastStickTS   = 0;
+static enum pad_mode    mPadMode;
+static u32              mResetFlag __attribute__ ((section(".noinit")));
+static Joystick_        *mJoyStick = NULL;
+static SubMSP           *mMSP;
+
+
+/*
+*****************************************************************************************
+* FUNCTIONS
+*****************************************************************************************
+*/
+u16 analogReadAvg(s16 pin) {
+    u16 v;
+    u32 sum = 0;
+    u16 values[ANALOG_RETRY_COUNT];
+
+    for (u8 i = 0; i < ANALOG_RETRY_COUNT; i++) {
+        v = analogRead(pin);
+        values[i] = v;
+        sum += v;
+    }
+
+    u16 avg = sum / ANALOG_RETRY_COUNT;
+    u8  cnt = ANALOG_RETRY_COUNT;
+    for (u8 i = 0; i < ANALOG_RETRY_COUNT; i++) {
+        v = values[i];
+        if (ABS(v - avg) > 100) {
+            sum -= v;
+            cnt --;
+        }
+    }
+    return (cnt > 0) ? (sum / cnt) : 0;
+}
+
+void printf(const __FlashStringHelper *fmt, ...) {
+#ifdef DEBUG    
+    char    buf[128];
+    va_list args;
+
+    va_start (args, fmt);
+
+#ifdef __AVR__
+    vsnprintf_P(buf, sizeof(buf), (const char *)fmt, args); // progmem for AVR
+#else
+    vsnprintf(buf, sizeof(buf), (const char *)fmt, args); // for the rest of the world
+#endif
+    va_end(args);
+
+    Serial.print(buf);
+#endif
+}
+
+void printf(char *fmt, ...) {
+#ifdef DEBUG
+    char    buf[128];
+    va_list args;
+
+    va_start (args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    Serial.print(buf);
+#endif
+}
+
+void setAxisRange(struct cal_info *info) {
+    if (mJoyStick != NULL && info != NULL) {
+        mJoyStick->setXAxisRange(info->left.minX, info->left.maxX);
+        mJoyStick->setYAxisRange(info->left.minY, info->left.maxY);
+        mJoyStick->setZAxisRange(info->right.minX, info->right.maxX);
+        mJoyStick->setRzAxisRange(info->right.minY, info->right.maxY);
+    }
+}
+
+
+#define MOUSE_MOVE_RANGE        12
+#define MOUSE_MOVE_THRESHOLD    2
+
+s16 getMouseMove(u16 v, u16 min, u16 max, u8 slow) {
+    s16 center = (max + min) / 2;
+    s16 range = slow ? 5 : MOUSE_MOVE_RANGE;
+    s16 dist;
+
+    dist = v - center;
+    dist = map(dist, -center, center, -range, range);
+
+    if (ABS(dist) < MOUSE_MOVE_THRESHOLD) {
+        dist = 0;
+    }
+
+    return dist;
+}
+
+
+/*
+*****************************************************************************************
+* SubMSP HANDLER
+*****************************************************************************************
+*/
+class SubMSP : public MSP 
+{
+    public:
+        SubMSP(Serial_ *serial):MSP(serial) { }
+    
+        virtual s8 onReceived(u8 cmd, u8 *data, u8 size, u8 *res) {
+            s8 ret = -1;
+
+            switch (cmd) {
+                case CMD_BATTERY:
+                    *((u16*)res) = analogReadAvg(PIN_A_BATTERY_SENSE);
+                    ret = 2;
+                    break;
+            }
+
+            return ret;
+        }
+};
+
+
+void setup() {
+    wdt_disable();
+    for (u8 i = 0; i < sizeof(TBL_PIN_BUTTONS); i++) {
+        pinMode(pgm_read_byte(&TBL_PIN_BUTTONS[i]), INPUT_PULLUP);
+        mLastBtnState[i] = 0;
+    }
+
+    for (u8 i = 0; i < sizeof(TBL_PIN_ANALOG); i++) {
+        pinMode(pgm_read_byte(&TBL_PIN_ANALOG[i]), INPUT);
+    }
+
+    EEPROM.get(0, mCalInfo);
+    if (mCalInfo.dwMagicID != MAGIC_ID) {
+        mCalInfo.left.minX = 230;
+        mCalInfo.left.maxX = 840;
+        mCalInfo.left.minY = 230;
+        mCalInfo.left.maxY = 840;
+        mCalInfo.right= mCalInfo.left;
+    }
+
+#ifdef FEATURE_KEYBOARD
+    Keyboard.begin();
+    mPadMode = MODE_KEYBOARD;
+#else
+    Mouse.begin();
+    mPadMode = MODE_MOUSE;
+#endif
+
+    if (mResetFlag == MAGIC_ID || mPadMode == MODE_MOUSE) {
+        mJoyStick = new Joystick_(JOYSTICK_DEFAULT_REPORT_ID,JOYSTICK_TYPE_GAMEPAD,
+                      BTN_REPORT_CNTS, HAT_CNTS,    // Button Count, Hat Switch Count
+                      true,  true,  true,           // X and Y, Z Axis
+                      false, false, true,           // Rx, Ry, or Rz
+                      false, false,                 // rudder or throttle
+                      false, false, false);         // accelerator, brake, or steering
+        mJoyStick->begin();
+        setAxisRange(&mCalInfo);
+        if (mResetFlag == MAGIC_ID) {
+            mPadMode = MODE_JOYSTICK;
+            mResetFlag = 0;
+        }
+    }
+    
+    Serial.begin(115200);
+    mMSP = new SubMSP(&Serial);
+}
+
+void loop() {
+    u8      state;
+    u8      shift;
+    u8      idx;
+    u8      btnNo;
+    u8      pressed;
+    u8      hatState;
+    s16     adcHat;
+    u16     lx, ly;
+    u16     rx, ry;
+    long    ts;
+
+    ts = millis();
+
+    if (ts - mLastStickTS > TIMEOUT_STICK_REPORT) {
+        pressed = 0;
+        for (u8 i = 0; i < sizeof(TBL_PIN_BUTTONS); i++) {
+            state = !digitalRead(pgm_read_byte(&TBL_PIN_BUTTONS[i]));
+
+            if (i == 0) {
+                shift = state;
+                idx   = 0;
+            } else {
+                idx   = shift ? (BTN_HW_CNTS + i) : i;
+            }
+
+            // check toggle
+            if (state != mLastBtnState[idx]) {
+                if (i == 0) {
+                    // handle asynchronous shift key press / release
+                    if (shift == 1) {
+                        pressed = 0x80;
+                        for (u8 j = 1; j <= BTN_REPORT_CNTS; j++) {
+                            if (mLastBtnState[j]) {
+                                if (mPadMode == MODE_JOYSTICK && mJoyStick != NULL) {
+                                    mJoyStick->setButton(j - 1, 0);
+                                } else if (mPadMode == MODE_KEYBOARD) {
+                                    Keyboard.release(pgm_read_byte(&TBL_MAP_BTN_KEY[j - 1]));
+                                }
+                                mLastBtnState[j] = 0;
+                            }
+                        }
+                    } else {
+                        for (u8 j = BTN_HW_CNTS + 1; j <= BTN_REPORT_CNTS; j++) {
+                            if (mLastBtnState[j]) {
+                                if (mPadMode == MODE_JOYSTICK && mJoyStick != NULL) {
+                                    mJoyStick->setButton(j - 1, 0);
+                                } else if (mPadMode == MODE_KEYBOARD) {
+                                    Keyboard.release(pgm_read_byte(&TBL_MAP_BTN_KEY[j - 1]));
+                                }
+                                mLastBtnState[j] = 0;
+                            }
+                        }
+                    }
+                } else {
+                    if (idx <= BTN_REPORT_CNTS) {
+                        if (mPadMode == MODE_JOYSTICK && mJoyStick != NULL) {
+                            mJoyStick->setButton(idx - 1, state);
+                        } else if (mPadMode == MODE_KEYBOARD) {
+                            if (state) {
+                                Keyboard.press(pgm_read_byte(&TBL_MAP_BTN_KEY[idx - 1]));
+                            } else {
+                                Keyboard.release(pgm_read_byte(&TBL_MAP_BTN_KEY[idx - 1]));
+                            }
+                        } else if (mPadMode == MODE_MOUSE && (idx - 1) < sizeof(TBL_MAP_BTN_MOUSE)) {
+                            if (state) {
+                                Mouse.press(pgm_read_byte(&TBL_MAP_BTN_MOUSE[idx - 1]));
+                            } else {
+                                Mouse.release(pgm_read_byte(&TBL_MAP_BTN_MOUSE[idx - 1]));
+                            }
+                        }
+                    } else {
+                        // input mode change button
+                        if (state) {
+                            if (idx == BTN_IDX_MOUSE_MODE) {
+#ifdef FEATURE_KEYBOARD
+                                mPadMode = MODE_KEYBOARD;
+#else
+                                mPadMode = MODE_MOUSE;
+#endif
+                            } else if (idx == BTN_IDX_JOYSTICK_MODE) {
+                                mPadMode = MODE_JOYSTICK;
+                            }
+                        }
+#ifdef FEATURE_KEYBOARD
+                        // USB re-enumeration for noobs
+                        if (mPadMode == MODE_JOYSTICK && mJoyStick == NULL) {
+                            mResetFlag = MAGIC_ID;
+                            wdt_enable(WDTO_15MS);
+                            // reset
+                        }
+#endif
+                    }
+                    pressed++;
+                }
+                mLastBtnState[idx] = state;
+            }
+        }
+
+
+        // check if only shift key is double clicked
+        if (pressed == 0x80) {
+            if (mShiftOnlyCtr == 0) {
+                mFirstShiftOnlyTS = ts;
+            }
+            if ((ts - mFirstShiftOnlyTS) < TIMEOUT_SHIFT_MCLICKS) {
+                mShiftOnlyCtr++;
+            }
+            printf(F("shift_btn %x %d %d\n"), pressed, mShiftOnlyCtr, ts);
+        }
+
+        if (mFirstShiftOnlyTS > 0 && (ts - mFirstShiftOnlyTS) > TIMEOUT_SHIFT_MCLICKS) {
+            if (mShiftOnlyCtr == 2) {
+                printf(F("cal change !! \n"));
+                mIsCalMode = !mIsCalMode;
+                if (mIsCalMode) {
+                    // set invalid range for calibration
+                    mCalInfo.left.minX = 8192;
+                    mCalInfo.left.maxX = 0;
+                    mCalInfo.left.minY = 8192;
+                    mCalInfo.left.maxY = 0;
+                    mCalInfo.right= mCalInfo.left;
+                    printf(F("cal mode enter\n"));
+                } else {
+                    // save min / max range
+                    printf(F("cal mode exit\n"));
+                    mCalInfo.dwMagicID = MAGIC_ID;
+                    EEPROM.put(0, mCalInfo);
+                    setAxisRange(&mCalInfo);
+                }
+            }
+            mShiftOnlyCtr    = 0;
+            mFirstShiftOnlyTS = 0;
+        }
+
+        lx = analogReadAvg(PIN_A_AXIS_LEFT_X);
+        ly = 1023 - analogReadAvg(PIN_A_AXIS_LEFT_Y);
+
+        rx = analogReadAvg(PIN_A_AXIS_RIGHT_X);
+        ry = 1023 - analogReadAvg(PIN_A_AXIS_RIGHT_Y);
+
+        if (mIsCalMode) {
+            mCalInfo.left.minX = MIN(lx, mCalInfo.left.minX);
+            mCalInfo.left.maxX = MAX(lx, mCalInfo.left.maxX);
+            mCalInfo.left.minY = MIN(ly, mCalInfo.left.minY);
+            mCalInfo.left.maxY = MAX(ly, mCalInfo.left.maxY);
+
+            mCalInfo.right.minX = MIN(rx, mCalInfo.right.minX);
+            mCalInfo.right.maxX = MAX(rx, mCalInfo.right.maxX);
+            mCalInfo.right.minY = MIN(ry, mCalInfo.right.minY);
+            mCalInfo.right.maxY = MAX(ry, mCalInfo.right.maxY);
+            //printf(F("lx:%4d - %4d, ly:%4d - %4d, rx:%4d - %4d, ry:%4d - %4d\n"),
+            //    mCalInfo.left.minX, mCalInfo.left.maxX, mCalInfo.left.minY, mCalInfo.left.maxY,
+            //    mCalInfo.right.minX, mCalInfo.right.maxX, mCalInfo.right.minY, mCalInfo.right.maxY);
+        }
+
+        if (mPadMode == MODE_JOYSTICK && mJoyStick != NULL) {
+            mJoyStick->setXAxis(lx);
+            mJoyStick->setYAxis(ly);
+            mJoyStick->setZAxis(rx);
+            mJoyStick->setRzAxis(ry);
+        } else if (mPadMode == MODE_MOUSE) {
+            s16 mx = getMouseMove(lx, mCalInfo.left.minX, mCalInfo.left.maxX, mLastBtnState[4]);
+            s16 my = getMouseMove(ly, mCalInfo.left.minY, mCalInfo.left.maxY, mLastBtnState[4]);
+            Mouse.move(mx, my, 0);
+        }
+
+        // process hat buttons
+        adcHat = analogReadAvg(PIN_A_AXIS_HAT_X);
+        if (adcHat > HAT_ADC_NO_KEY) {
+            hatState = HAT_NONE;
+        } else if (adcHat > HAT_ADC_RIGHT_UP) {
+            hatState = HAT_RIGHT;
+        } else {
+            hatState = HAT_LEFT;
+        }
+
+        adcHat = analogReadAvg(PIN_A_AXIS_HAT_Y);
+        if (adcHat > HAT_ADC_NO_KEY) {
+            hatState += HAT_NONE;
+        } else if (adcHat > HAT_ADC_RIGHT_UP) {
+            hatState += HAT_UP;
+        } else {
+            hatState += HAT_DOWN;
+        }
+
+        if (mLastHatState != hatState) {
+            if (mPadMode == MODE_JOYSTICK && mJoyStick != NULL) {
+                mJoyStick->setHatSwitch(0, pgm_read_word(&TBL_ANGLES[hatState]));
+            } else if (mPadMode == MODE_KEYBOARD) {
+                u8 changed = mLastHatState ^ hatState;
+
+                for (u8 i = 0; i < sizeof(TBL_MAP_HAT_KEY) / 2; i++) {
+                    u8 hat = pgm_read_byte(&TBL_MAP_HAT_KEY[i * 2]);
+                    u8 key = pgm_read_byte(&TBL_MAP_HAT_KEY[i * 2 + 1]);
+
+                    if (changed & hat) {
+                        if (hatState & hat) {
+                            Keyboard.press(key);
+                        } else {
+                            Keyboard.release(key);
+                        }
+                    }
+                }
+            }
+            mLastHatState = hatState;
+        }
+        mLastStickTS = ts;
+    }
+    mMSP->handleRX();
+}
