@@ -13,14 +13,43 @@
 #You should have received a copy of the GNU General Public License
 #along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from serial import Serial
-from threading import Event
-from time import sleep, time
+import serial
 import threading
 import struct
+import signal
+import subprocess
+import time
+import array
+import os
+import signal
+import subprocess
+import math
 
+###################################################################################################
+# CONSTANTS
+###################################################################################################
+APP_PATH      = os.path.dirname(os.path.abspath(__file__))
+
+# BATTERY CONFIGURATION
+RATE_BATT_MS  = 2000
+R1            = 10000
+R2            =  5100
+VOLT_CHARGING = 8.45
+VOLT_100      = 4.1  * 2
+VOLT_75       = 3.76 * 2
+VOLT_50       = 3.63 * 2
+VOLT_25       = 3.5  * 2
+VOLT_0        = 3.2  * 2
+
+class COMMANDS:
+    NOP              = 0x00
+    GET_BATTERY_ADC  = 0x01
+
+
+###################################################################################################
+# MSP CLASS
+###################################################################################################
 class MSP(threading.Thread):
-
     class _MSPSTATES:
         """Enum of MSP States"""
         IDLE         = 0
@@ -36,23 +65,20 @@ class MSP(threading.Thread):
             self.finished = False
             self.data = []
 
-###################################################################################################
-# CONVERSION FUNCTIONS
-###################################################################################################
     def __init__(self, serial):
         threading.Thread.__init__(self)
         self._port = serial
-        self._exitNow = Event()
+        self._exitNow = threading.Event()
         self._responses = {}
         self.responseTimeout = 3
 
-    def run(self): 
+    def run(self):
         state        = self._MSPSTATES.IDLE
         data         = bytearray()
         dataSize     = 0
         dataChecksum = 0
         command      = 0
-        
+
         while (not self._exitNow.isSet()):
             if (self._port.inWaiting() > 0):
                 inByte = ord(self._port.read())
@@ -84,17 +110,18 @@ class MSP(threading.Thread):
                         pass
                     state = self._MSPSTATES.IDLE
             else:
-                sleep(0.1)
-                
+                time.sleep(0.1)
+
         print("MSP thread finished")
 
     def _stop(self):
         self._exitNow.set()
         self.join()
+        self._port.close()
 
     def __del__(self):
         self._stop()
-    
+
     def stop(self):
         self._stop()
 
@@ -178,13 +205,13 @@ class MSP(threading.Thread):
 
     def _waitForResponse(self, command):
         if (self._responses.has_key(command)):
-            startTime = time()
+            startTime = time.time()
             while True:
                 if self._responses[command].finished:
                     return True
-                if (time() - startTime > self.responseTimeout):
+                if (time.time() - startTime > self.responseTimeout):
                     return False
-                sleep(0)
+                time.sleep(0)
         else:
             return False
 
@@ -221,3 +248,151 @@ class MSP(threading.Thread):
             process incoming data from the device.
         """
         pass
+
+
+###################################################################################################
+# Subclassing from MSP
+###################################################################################################
+class SubMSP(MSP):
+    def __init__(self, port):
+        super(SubMSP, self).__init__(serial.Serial(port, 115200, writeTimeout = 0.1))
+        self._tblCommand = {
+            0x00 : self._nop,
+            0x01 : self._handleBattery
+        }
+        self._curPercent = ""
+        self._procOSD    = None
+        self._listVolts  = []
+        self._isCharging = False
+        self._lastBattTS = 0
+
+    def stop(self):
+        super(SubMSP, self).stop()
+        if self._procOSD != None:
+            self._procOSD.terminate()
+            self._procOSD.wait()
+            self._procOSD = None
+            #print "kill pid:%d" % self._procOSD.pid
+
+
+    def _volt2adc(self, volt):
+        vout = R2 / (R1 + R2) * volt
+        adc  = vout / 5 * 1024
+        return adc
+
+    def _adc2volt(self, adc):
+        vout = adc * 5.0 / 1024.0
+        volt = vout * (R1 + R2) / R2
+        return volt
+
+    def _nop(self, data):
+        pass
+        #print "_nop "
+        #print ("{0}".format(", ".join("{:02X}".format(c) for c in data)))
+
+
+    def _dispBattery(self, percent):
+        if self._curPercent != percent:
+            if self._procOSD != None:
+                self._procOSD.terminate()
+                self._procOSD.wait()
+                #print "kill pid:%d" % self._procOSD.pid
+                self._procOSD = None
+
+            self._curPercent = percent
+            self._procOSD = subprocess.Popen([APP_PATH + "/pngview", "-b0x0000", "-l30000", "-n", "-x768", "-y2",
+                APP_PATH + "/battery_" + percent + ".png"])
+
+            #print "%d" % self._procOSD.pid
+
+    def _handleBattery(self, data):
+        adc  = self.toUInt16(data);
+        volt = self._adc2volt(adc);
+
+        # first check charging status change
+        if volt > VOLT_CHARGING:
+            self._isCharging = True
+        elif self._isCharging == True:
+            del self._listVolts[:]
+            self._isCharging = False
+
+        # append volt to 20 sec window
+        if len(self._listVolts) >= 20:
+            self._listVolts.pop(0)
+        self._listVolts.append(volt)
+
+        # get avg volt
+        sum = 0
+        for v in self._listVolts:
+            sum = sum + v
+        avg = sum / len(self._listVolts)
+
+        #print "battery => %d %fV (%d) => %fV" % (adc, volt, len(self._listVolts), avg)
+
+        if self._isCharging == True:
+            self._dispBattery("charging")
+        elif avg > VOLT_100:
+            self._dispBattery("100")
+        elif avg > VOLT_75:
+            self._dispBattery("75")
+        elif avg > VOLT_50:
+            self._dispBattery("50")
+        elif avg > VOLT_25:
+            self._dispBattery("25")
+        else:
+            self._dispBattery("0")
+
+    def commandRecceived(self, command, data, error=False):
+        result = self._tblCommand.get(command, self._nop)
+        if result:
+            result(data)
+
+    def process(self, ts):
+        # probe battery level
+        if ts - self._lastBattTS > RATE_BATT_MS:
+            self.sendCommand(COMMANDS.GET_BATTERY_ADC)
+            self._lastBattTS = ts
+            left = 0
+        else:
+            left = RATE_BATT_MS - (ts - self._lastBattTS)
+        return left
+
+
+###################################################################################################
+# MAIN
+###################################################################################################
+_isExit = threading.Event()
+
+def _handleSignal(signum, frame):
+    _isExit.set()
+
+def _main(serialPort):
+    signal.signal(signal.SIGINT, _handleSignal)
+    signal.signal(signal.SIGTERM, _handleSignal)
+
+    msp = SubMSP(serialPort)
+    msp.setDaemon(True)
+    msp.start()
+
+    while (not _isExit.isSet()):
+        ts   = int(round(time.time() * 1000))
+        left = msp.process(ts);
+        if left > 0:
+            time.sleep(left / 1000)
+
+    msp.stop()
+
+if __name__ == "__main__":
+    import sys
+
+    try:
+        _main(sys.argv[1])
+
+    # Catch all other non-exit errors
+    except Exception as e:
+        sys.stderr.write("Unexpected exception: %s" % e)
+        sys.exit(1)
+
+    # Catch the remaining exit errors
+    except:
+        sys.exit(0)

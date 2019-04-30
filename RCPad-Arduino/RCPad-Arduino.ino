@@ -187,6 +187,8 @@ static const u8 PROGMEM TBL_MAP_BTN_KEY[] = {
     '6',            // SHIFT + R1
     '7',            // SHIFT + L2
     '8',            // SHIFT + R2
+    '9',            // SHIFT + SELECT
+    '0',            // SHIFT + START
 };
 
 static const u8 PROGMEM TBL_MAP_BTN_MOUSE[] = {
@@ -465,12 +467,22 @@ void loop() {
                                     } else {
                                         Mouse.release(pgm_read_byte(&TBL_MAP_BTN_MOUSE[idx - 1]));
                                     }
-                                }                            
+                                } else {
+                                    if (mJoyStick != NULL) {
+                                        mJoyStick->setButton(idx - 1, state);
+                                    }
+                                }
                                 break;
                                 
                             case MODE_OSD:
-                                if (pin == PIN_BTN_START) {
-                                    mJoyStick->setButton(BTN_REPORT_CNTS - 1, state);
+                                if (mJoyStick != NULL) {
+                                    if (pin == PIN_BTN_START) {
+                                        mJoyStick->setButton(BTN_REPORT_CNTS - 1, state);
+                                    } else {
+                                        if (mJoyStick != NULL) {
+                                            mJoyStick->setButton(idx - 1, state);
+                                        }
+                                    }
                                 }
                                 break;
                         }
@@ -602,7 +614,11 @@ void loop() {
             //    mCalInfo.right.minX, mCalInfo.right.maxX, mCalInfo.right.minY, mCalInfo.right.maxY);
         }
 
-        if (mPadMode == MODE_JOYSTICK && mJoyStick != NULL) {
+        if (mPadMode == MODE_MOUSE) {
+            s16 mx = getMouseMove(LX, mCalInfo.left.minX, mCalInfo.left.maxX, mLastBtnState[4]);
+            s16 my = getMouseMove(LY, mCalInfo.left.minY, mCalInfo.left.maxY, mLastBtnState[4]);
+            Mouse.move(mx, my, 0);
+        } else if (mJoyStick != NULL) {
             if (LX != mLastLX) {
                 mJoyStick->setXAxis(LX);
                 mLastLX = LX;
@@ -619,10 +635,6 @@ void loop() {
                 mJoyStick->setRzAxis(RY);
                 mLastRY = RY;
             }
-        } else if (mPadMode == MODE_MOUSE) {
-            s16 mx = getMouseMove(LX, mCalInfo.left.minX, mCalInfo.left.maxX, mLastBtnState[4]);
-            s16 my = getMouseMove(LY, mCalInfo.left.minY, mCalInfo.left.maxY, mLastBtnState[4]);
-            Mouse.move(mx, my, 0);
         }
 
 
